@@ -1,0 +1,12 @@
+﻿# Web Framework
+fastapi
+uvicorn[standard]
+
+# AI & API
+openai
+requests
+python-dotenv
+
+# Data & Logic
+pydantic
+pandas

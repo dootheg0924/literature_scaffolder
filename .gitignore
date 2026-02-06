@@ -1,0 +1,12 @@
+﻿# Python
+backend/.venv/
+backend/__pycache__/
+backend/.env
+
+# Node.js
+frontend/node_modules/
+frontend/dist/
+
+# Database & OS
+tutor_system.db
+.DS_Store
