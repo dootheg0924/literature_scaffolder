@@ -1,6 +1,7 @@
 ﻿import os
 import sys
 import sqlite3
+import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Optional
@@ -11,24 +12,17 @@ if current_dir not in sys.path:
     sys.path.append(current_dir)
 
 from dotenv import load_dotenv
-load_dotenv(dotenv_path=os.path.join(current_dir, ".env"))
 
 dotenv_path = os.path.join(current_dir, ".env")
 loaded = load_dotenv(dotenv_path=dotenv_path)
 print(f"load_dotenv path={dotenv_path}, returned={loaded}, exists={os.path.exists(dotenv_path)}")
-
 key = os.getenv("OPENAI_API_KEY")
-if not key:
-    print("OPENAI_API_KEY not found in environment")
-    raise RuntimeError("OPENAI_API_KEY가 설정되어 있지 않습니다.")
-else:
-    print(f"OPENAI_API_KEY loaded, length={len(key)}")
-
 
 from schemas import AppSessionState, Poem, Message, UserLevel, AgentRole
 from services.poem_loader import PoemLoader
 from services.dictionary import DictionaryService
-from agents import TeacherAgent, CriticAAgent, CriticBAgent
+from agents import EmpathyAgent, AestheticAgent, InterpretiveAgent
+
 
 app = FastAPI(title="Scaffolder Backend API")
 
@@ -43,9 +37,9 @@ app.add_middleware(
 
 poem_loader = PoemLoader("data/KPoEM_poem_dataset_v4.tsv")
 dict_service = DictionaryService()
-teacher_agent = TeacherAgent()
-critic_a = CriticAAgent()
-critic_b = CriticBAgent()
+emp_agent = EmpathyAgent()
+ase_agent = AestheticAgent()
+int_agent = InterpretiveAgent()
 
 all_poems = poem_loader.load()
 
@@ -119,40 +113,6 @@ async def get_profile(user_name: str):
         "is_new": True
     }
 
-# --- API 엔드포인트 정의 ---
-@app.post("/api/chat/teacher")
-async def chat_with_teacher(payload: dict):
-    try:
-        # 1. 요청 데이터 파싱
-        user_name = payload.get("user_name", "학생")
-        poem_data = payload.get("selected_poem")
-        history_data = payload.get("chat_history", [])
-        user_input = payload.get("user_input")
-        level_data = payload.get("user_level", {"emp_state": 1, "ase_state": 1, "int_state": 1})
-        
-        if not history_data:
-            user_input = "시를 선택했어. 첫 인사를 건네주렴."
-        else:
-            user_input = payload.get("user_input")
-
-        # 2. 대화 기록을 Message 객체 리스트로 변환
-        chat_history = [Message(**m) for m in history_data]
-
-        # 3. 세션 상태 구성
-        state = AppSessionState(
-            user_name=user_name,
-            user_level=UserLevel(**level_data),
-            selected_poem=Poem(**poem_data),
-            teacher_chat_history=chat_history
-        )
-
-        # 4. 교사 에이전트로부터 답변 생성
-        response = teacher_agent.get_response(state, user_input)
-        
-        return {"message": response}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/api/poems", response_model=List[Poem])
 async def get_poems():
     """KPoEM 데이터셋에서 전체 시 목록을 반환합니다."""
@@ -184,59 +144,46 @@ async def search_word(payload: Dict[str, str]):
         
     return {"word": word, "meanings": meanings}
 
-@app.post("/api/chat/critique")
-async def get_critique(poem: Poem):
-    """비평가 A와 B의 비평을 순차적으로 생성하여 반환합니다."""
+@app.post("/api/chat/multi")
+async def chat_multi_agents(payload: dict):
     try:
-        # 1. 비평가 A가 먼저 비평문을 작성합니다.
-        essay_a = critic_a.write_initial_essay(poem.title, poem.content)
-
-        # 2. 비평가 B가 A의 글을 보고 반대 관점을 제시합니다.
-        essay_b = critic_b.write_counter_essay(poem.title, poem.content, essay_a)
-
-        return {
-            "critic_a": essay_a,
-            "critic_b": essay_b
-        }
-    except Exception as e:
-        print(f"Critique Generation Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"비평 생성 중 오류가 발생했습니다: {str(e)}")
-
-@app.post("/api/chat/{agent_type}")
-async def multi_agent_chat(agent_type: str, payload: dict):
-    try:
-        agent_map = {"teacher": teacher_agent, "criticA": critic_a, "criticB": critic_b}
-        target_agent = agent_map.get(agent_type)
-        if not target_agent:
-            raise HTTPException(status_code=404, detail="에이전트를 찾을 수 없습니다.")
-
-        # 데이터 파싱
+        # 1. 데이터 파싱
         user_name = payload.get("user_name", "학생")
         poem_data = payload.get("selected_poem")
-        history_data = payload.get("chat_history", [])
-        user_input = payload.get("user_input")
+        # 공유 히스토리를 가져옵니다. 없으면 빈 리스트로 시작합니다.
+        history_data = payload.get("shared_chat_history", []) 
+        user_input = payload.get("user_input", "")
         level_data = payload.get("user_level", {"emp_state": 1, "ase_state": 1, "int_state": 1})
 
-        # 객체 변환 및 세션 상태 구성
-        chat_history = [Message(**m) for m in history_data]
-        
-        state_args = {
-            "user_name": user_name,
-            "user_level": UserLevel(**level_data),
-            "selected_poem": Poem(**poem_data)
-        }
-        
-        # 에이전트 종류에 따라 히스토리 필드 매핑
-        if agent_type == "teacher": state_args["teacher_chat_history"] = chat_history
-        elif agent_type == "criticA": state_args["critic_a_chat_history"] = chat_history
-        elif agent_type == "criticB": state_args["critic_b_chat_history"] = chat_history
+        # 첫 접속 시(히스토리가 없을 때) 기본 입력 설정
+        if not history_data and not user_input:
+            user_input = "시를 선택했어. 각 교사의 관점과 학생의 수준을 고려한 첫 질문을 만들어 줘."
 
-        state = AppSessionState(**state_args)
-        response = target_agent.get_response(state, user_input)
-        
-        return {"message": response}
+        # 2. 객체 변환 및 세션 상태 구성
+        shared_history = [Message(**m) for m in history_data]
+        state = AppSessionState(
+            user_name=user_name,
+            user_level=UserLevel(**level_data),
+            selected_poem=Poem(**poem_data),
+            shared_chat_history=shared_history  # 모든 에이전트가 이 히스토리를 공유합니다.
+        )
+
+        # 3. 비동기 병렬 호출 (시니어의 기술)
+        # 세 명의 에이전트에게 동시에 질문을 던집니다.
+        responses = await asyncio.gather(
+            asyncio.to_thread(emp_agent.get_response, state, user_input),
+            asyncio.to_thread(ase_agent.get_response, state, user_input),
+            asyncio.to_thread(int_agent.get_response, state, user_input)
+        )
+
+        # 4. 결과 반환
+        return {
+            "empathy": responses[0],
+            "aesthetic": responses[1],
+            "interpretive": responses[2]
+        }
     except Exception as e:
-        print(f"Multi-agent Chat Error ({agent_type}): {str(e)}")
+        print(f"Multi-Agent API Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
